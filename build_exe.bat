@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 rem 版本号需要与 shortcut_notifier.py 中的 VERSION 保持一致
-set EXE_NAME=快捷键提示-1.3.2-beta
+set EXE_NAME=Keycastr-1.3.3-beta
 
 python make_icon.py
 pyinstaller --noconfirm --clean --onefile --windowed --name ShortcutNotifier --icon icon.ico shortcut_notifier.py

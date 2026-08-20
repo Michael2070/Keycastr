@@ -39,12 +39,16 @@ from preset_library import PRESET_LIBRARY, PRESET_ORDER
 #          误判（GetLastError 陈旧值）
 #   1.3.2  持续输出模式状态自愈（任务管理器过滤后自动校准）、预设展开字号
 #          DPI 缩放修复、任务管理器首次运行提示与系统页常驻说明
-VERSION = "1.3.2"
+#   1.3.3  项目迁移至 Keycastr 目录并正式改名 Keycastr（设置界面括号标注
+#          快捷键提示），更新单实例互斥与开机自启键名并清理旧版残留
+VERSION = "1.3.3"
 
 ctk.set_appearance_mode("dark")
 
-APP_NAME = f"快捷键提示-{VERSION}-beta"
-AUTOSTART_NAME = "ShortcutNotifier"
+APP_NAME = f"Keycastr-{VERSION}-beta"
+APP_NAME_CN = f"{APP_NAME}（快捷键提示）"
+AUTOSTART_NAME = "Keycastr"
+AUTOSTART_LEGACY_NAME = "ShortcutNotifier"
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 MOD_ORDER = {'ctrl': 0, 'alt': 1, 'shift': 2, 'win': 3}
@@ -136,7 +140,7 @@ def ensure_single_instance():
         # 先清零错误码，避免成功调用后 GetLastError 返回旧值导致误判
         ctypes.windll.kernel32.SetLastError(0)
         _SINGLE_INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
-            None, False, "ShortcutNotifierSingleInstance")
+            None, False, "KeycastrSingleInstance")
         return ctypes.windll.kernel32.GetLastError() != 183
     except Exception:
         return True
@@ -1721,7 +1725,7 @@ class ShortcutNotifier:
 
         win = ctk.CTkToplevel(self.root)
         self.settings_window = win
-        win.title(f"{APP_NAME}设置")
+        win.title(f"{APP_NAME_CN}设置")
         win.geometry("980x720")
         win.minsize(880, 640)
         win.attributes('-topmost', False)
@@ -1730,7 +1734,7 @@ class ShortcutNotifier:
         header = ctk.CTkFrame(win, fg_color='transparent')
         header.pack(fill='x', padx=24, pady=(18, 6))
         ctk.CTkLabel(
-            header, text=APP_NAME,
+            header, text=APP_NAME_CN,
             font=ctk.CTkFont(size=22, weight='bold')).pack(side='left')
         ctk.CTkLabel(
             header, text="  快捷键视觉反馈 · 设置",
@@ -2549,7 +2553,7 @@ class ShortcutNotifier:
             card4, text="关于", font=ctk.CTkFont(size=15, weight='bold'),
             anchor='w').pack(fill='x', padx=16, pady=(14, 0))
         about_rows = [
-            ("软件名", f"{APP_NAME}"),
+            ("软件名", f"{APP_NAME_CN}"),
             ("开发者", "Michael2070"),
             ("开发环境", "Windows / Python 3.13 + Tkinter（CustomTkinter）"),
             ("AI 模型", "GPT-5（Codex）"),
@@ -2789,6 +2793,8 @@ class ShortcutNotifier:
     def _ensure_autostart(self):
         """首次运行（默认开启自启）时确保注册表/启动项真正写入"""
         try:
+            # 清理旧版（ShortcutNotifier 命名）残留的开机自启项，避免指向已迁移的旧路径
+            self.remove_legacy_autostart()
             if not self.settings.get('autostart'):
                 return
             if self.check_autostart():
@@ -2806,6 +2812,32 @@ class ShortcutNotifier:
                         pass
         except Exception as e:
             safe_log(f"开机自启初始化异常: {e}")
+
+    def remove_legacy_autostart(self):
+        """删除旧版命名的开机自启残留（注册表值与启动文件夹批处理）"""
+        try:
+            try:
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH,
+                    0, winreg.KEY_SET_VALUE)
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_LEGACY_NAME)
+                except FileNotFoundError:
+                    pass
+                winreg.CloseKey(key)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            appdata = os.environ.get('APPDATA', '')
+            if appdata:
+                legacy_bat = os.path.join(
+                    appdata, r'Microsoft\Windows\Start Menu\Programs\Startup',
+                    AUTOSTART_LEGACY_NAME + '.bat')
+                if os.path.exists(legacy_bat):
+                    os.remove(legacy_bat)
+        except Exception as e:
+            safe_log(f"清理旧版开机自启失败: {e}")
 
     def tray_toggle_autostart(self, icon, item):
         self.root.after(
@@ -2877,7 +2909,7 @@ class ShortcutNotifier:
         return image
 
     def test_notification(self):
-        self._show_message("测试：快捷键提示功能正常", '__test__')
+        self._show_message("测试：Keycastr 功能正常", '__test__')
 
     def tray_toggle_auto_mode(self, icon, item):
         self.root.after(0, self._toggle_auto_mode)
