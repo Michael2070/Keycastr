@@ -41,12 +41,18 @@ from preset_library import PRESET_LIBRARY, PRESET_ORDER
 #          DPI 缩放修复、任务管理器首次运行提示与系统页常驻说明
 #   1.3.3  项目迁移至 Keycastr 目录并正式改名 Keycastr（设置界面括号标注
 #          快捷键提示），更新单实例互斥与开机自启键名并清理旧版残留
-VERSION = "1.3.3"
+#   1.4.0  修复重启崩溃（onefile 临时目录冲突、优雅退出）；字号改为按显示器
+#          DPI 的像素渲染并支持分辨率变化后自动恢复；新增文字透明度；真实
+#          提示框实时预览；预设快捷键可修改；新增 PowerToys (Preview) 预设、
+#          浏览器预设合并多款主流浏览器、补齐 Windows 快捷键；系统页信息
+#          完善与设置路径可复制/跳转；未保存修改退出确认
+VERSION = "1.4.0"
 
 ctk.set_appearance_mode("dark")
 
 APP_NAME = f"Keycastr-{VERSION}-beta"
 APP_NAME_CN = f"{APP_NAME}（快捷键提示）"
+PREVIEW_TEXT = "外观预览 · Ctrl+T 新建标签页"
 AUTOSTART_NAME = "Keycastr"
 AUTOSTART_LEGACY_NAME = "ShortcutNotifier"
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -182,6 +188,54 @@ def offset_points(points, dx, dy):
     """把坐标点集整体平移 (dx, dy)"""
     return [points[i] + (dx if i % 2 == 0 else dy)
             for i in range(len(points))]
+
+
+def blend_hex(fore, back, alpha):
+    """按 alpha 混合前景色与背景色（0~1），返回 #RRGGBB"""
+    try:
+        f = fore.lstrip('#')
+        b = back.lstrip('#')
+        if len(f) != 6 or len(b) != 6:
+            return fore
+        alpha = min(1.0, max(0.0, float(alpha)))
+        fr = [int(f[i:i + 2], 16) for i in (0, 2, 4)]
+        br = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
+        out = [round(c * alpha + d * (1 - alpha)) for c, d in zip(fr, br)]
+        return '#{:02X}{:02X}{:02X}'.format(*out)
+    except Exception:
+        return fore
+
+
+def get_monitor_dpi_scale(hwnd):
+    """窗口/句柄所在显示器的有效 DPI 缩放系数（GetDpiForMonitor）"""
+    try:
+        user32 = ctypes.windll.user32
+        shcore = ctypes.windll.shcore
+        if not hwnd:
+            return None
+        monitor = user32.MonitorFromWindow(
+            hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return None
+        x = ctypes.c_uint()
+        y = ctypes.c_uint()
+        if shcore.GetDpiForMonitor(
+                monitor, 0, ctypes.byref(x), ctypes.byref(y)) == 0:
+            return ((x.value + y.value) / 2.0) / 96.0
+    except Exception:
+        pass
+    return None
+
+
+def get_system_dpi_scale():
+    """系统主显示器 DPI 缩放系数（作为兜底）"""
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi and dpi != 96:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
 
 
 def is_valid_color(value):
@@ -416,6 +470,7 @@ class Settings:
             'taskmgr_notice_shown': False,
             'appearance': {
                 'window_opacity': 0.75,
+                'text_opacity': 1.0,
                 'display_duration': 1500,
                 'fade_duration': 500,
                 'position': 'bottom-center',
@@ -489,6 +544,10 @@ class Settings:
             ap['window_opacity'] = min(1.0, max(0.3, float(ap['window_opacity'])))
         except Exception:
             ap['window_opacity'] = 0.75
+        try:
+            ap['text_opacity'] = min(1.0, max(0.1, float(ap['text_opacity'])))
+        except Exception:
+            ap['text_opacity'] = 1.0
         try:
             ap['display_duration'] = int(ap['display_duration'])
         except Exception:
@@ -755,10 +814,17 @@ class ShortcutNotifier:
         self.preset_count_labels = {}
         self.preset_row_vars = {}
         self.preset_display_vars = {}
+        self.preset_key_labels = {}
         self.preset_bodies = {}
         self.preset_expand_buttons = {}
         self.capture_dialog = None
         self.settings_snapshot = None
+        self.settings_dirty = False
+        self.settings_tabview = None
+        self.live_preview_active = False
+        self.live_preview_after = None
+        self._restarting = False
+        self._exiting = False
 
         # 键盘监听线程控制
         self.listener_thread = None
@@ -820,11 +886,26 @@ class ShortcutNotifier:
                 continue
             state = self.settings.get('preset_states', {}).get(pid, {})
             overrides = state.get('shortcuts', {})
+            # 先处理用户修改过的快捷键（显式指定，优先级最高）
             for sc, cfg in preset['shortcuts'].items():
-                if sc in active:
-                    continue
                 ov = overrides.get(sc, {})
                 if ov.get('enabled') is False:
+                    continue
+                effective = ov.get('key')
+                if not effective:
+                    continue
+                if effective in active:
+                    continue
+                display = ov.get('display') or cfg.get('display') or sc
+                active[effective] = display
+            # 再处理未修改的预设快捷键
+            for sc, cfg in preset['shortcuts'].items():
+                ov = overrides.get(sc, {})
+                if ov.get('enabled') is False:
+                    continue
+                if ov.get('key'):
+                    continue
+                if sc in active:
                     continue
                 display = ov.get('display') or cfg.get('display') or sc
                 active[sc] = display
@@ -845,14 +926,48 @@ class ShortcutNotifier:
     # ---------- DPI 与版本迁移 ----------
 
     def get_dpi_scale(self):
-        """屏幕缩放系数：字号补偿用（200% 缩放 = 2.0）"""
+        """屏幕缩放系数：优先取主窗口所在显示器，失败回退系统 DPI"""
         try:
-            dpi = ctypes.windll.user32.GetDpiForSystem()
-            if dpi and dpi != 96:
-                return dpi / 96.0
+            hwnd = self.root.winfo_id()
+            scale = get_monitor_dpi_scale(hwnd)
+            if scale and scale > 0:
+                return scale
         except Exception:
             pass
-        return 1.0
+        return get_system_dpi_scale()
+
+    def _pt_to_px(self, pt):
+        """把“磅”字号换算为物理像素（Tk 负号字号按像素精确渲染）"""
+        try:
+            return max(6, round(float(pt) * self.font_scale * 4.0 / 3.0))
+        except Exception:
+            return max(6, int(pt))
+
+    def _refresh_dpi(self):
+        """动态检测 DPI 缩放变化（分辨率/缩放调整后自动恢复字号与提示框大小）"""
+        try:
+            new_scale = self.get_dpi_scale()
+            if abs(new_scale - self.font_scale) > 0.01:
+                old_scale = self.font_scale
+                self.font_scale = new_scale
+                safe_log(
+                    f"检测到 DPI 缩放变化 {old_scale:.2f} -> {new_scale:.2f}")
+                self._on_dpi_changed()
+                return True
+        except Exception as e:
+            safe_log(f"DPI 检测失败: {e}")
+        return False
+
+    def _on_dpi_changed(self):
+        """DPI 变化后刷新所有依赖缩放的渲染"""
+        try:
+            if self.window and self.window.winfo_exists():
+                if self.current_message:
+                    self.update_window_content()
+                else:
+                    self.force_close_window()
+        except Exception:
+            pass
 
     def _migrate_font_size(self):
         """把旧版本（未做 DPI 补偿）里为了补偿而调大的字号换算回真实磅值"""
@@ -927,14 +1042,18 @@ class ShortcutNotifier:
         self.watchdog_check()
 
     def watchdog_check(self):
-        if not self.watchdog_active or not self.window:
+        if not self.watchdog_active and not self.live_preview_active:
             self.watchdog_active = False
             return
         try:
             if not self.window.winfo_exists():
                 self.watchdog_active = False
                 return
-            if time.time() - self.window_created_time > self.get_window_lifetime():
+            self._refresh_dpi()
+            if self.live_preview_active:
+                # 实时预览期间保持显示，不做超时关闭
+                self._keep_preview_alive()
+            elif time.time() - self.window_created_time > self.get_window_lifetime():
                 self.force_close_window()
                 return
             # 保持置顶：防止 Win+D 等操作后提示窗被新出现的窗口盖住
@@ -952,6 +1071,7 @@ class ShortcutNotifier:
 
     def heartbeat_check(self):
         try:
+            self._refresh_dpi()
             if not (self.listener_thread and self.listener_thread.is_alive()):
                 self.start_listener()
             # 长时间无按键后（含睡眠唤醒场景）重新注册一次热键，避免钩子失效
@@ -1159,7 +1279,7 @@ class ShortcutNotifier:
                         self.cont_keys = []
                         self.cont_count = 1
                         changed = True
-                if changed and self.cont_active:
+                if changed and self.cont_active and not self.suspend_hotkeys:
                     self._show_continuous()
         except Exception:
             pass
@@ -1181,7 +1301,9 @@ class ShortcutNotifier:
                 now = time.time()
                 elevated = is_foreground_elevated()
                 hook_silent = now - self.last_activity_time > 3
-                if elevated or hook_silent:
+                # 持续输出模式始终轮询修饰键，保证任务管理器等过滤场景下
+                # Ctrl/Shift/Alt/Win 的按下与释放都能被捕捉
+                if elevated or hook_silent or self.continuous_mode:
                     self._poll_key_states()
             except Exception:
                 pass
@@ -1225,6 +1347,9 @@ class ShortcutNotifier:
                 self.cont_active = False
             return
         if kind == 'mod':
+            # 钩子与轮询可能重复上报同一按下事件，避免重复计数
+            if name in self.cont_pressed:
+                return
             if not self.cont_active:
                 self.cont_active = True
                 self.cont_keys = []
@@ -1232,6 +1357,8 @@ class ShortcutNotifier:
             self.cont_pressed.add(name)
             self._show_continuous()
         elif kind == 'key':
+            if name in self.cont_pressed:
+                return
             if not self.cont_active:
                 return
             self.cont_pressed.add(name)
@@ -1302,8 +1429,9 @@ class ShortcutNotifier:
     def _estimate_text_size(self, text, font_size):
         """粗略估算文本尺寸（仅用于创建窗口前的初值，最终以渲染测量为准）"""
         try:
+            px = self._pt_to_px(font_size)
             self.measure_font.configure(
-                size=max(6, int(font_size * self.font_scale)))
+                size=-px)
             width = int(self.measure_font.measure(text))
             height = int(self.measure_font.metrics('linespace'))
         except Exception:
@@ -1315,20 +1443,28 @@ class ShortcutNotifier:
             height = font_size + 10
         return width, height
 
+    def _text_fill(self):
+        """文字渲染颜色：按文字透明度与背景色混合（Tk 画布不支持单项 alpha）"""
+        ap = self.settings['appearance']
+        text = ap.get('text_color') or '#FFFFFF'
+        bg = ap.get('bg_color') or '#2D2B3E'
+        alpha = float(ap.get('text_opacity') or 1.0)
+        return blend_hex(text, bg, alpha)
+
     def _draw_content(self, text, font_size):
         """在画布上绘制内容（按当前窗口尺寸居中，超宽自动换行）"""
         self.canvas.delete('all')
         self.draw_rounded_rect()
         wrap_width = max(20, self.window_width - self.horizontal_padding)
-        render_size = max(6, int(font_size * self.font_scale))
+        render_px = self._pt_to_px(font_size)
         self.canvas.create_text(
             self.window_width // 2,
             self.window_height // 2,
             text=text,
             width=wrap_width,
             justify='center',
-            font=('Microsoft YaHei', render_size, 'bold'),
-            fill=self.settings['appearance']['text_color'])
+            font=('Microsoft YaHei', -render_px, 'bold'),
+            fill=self._text_fill())
 
     def _get_measure_wrap_width(self):
         """测量文本时使用的最大换行宽度（固定宽度或自动上限）"""
@@ -1342,15 +1478,15 @@ class ShortcutNotifier:
         self.canvas.delete('all')
         self.draw_rounded_rect()
         wrap_width = self._get_measure_wrap_width()
-        render_size = max(6, int(font_size * self.font_scale))
+        render_px = self._pt_to_px(font_size)
         item = self.canvas.create_text(
             self.window_width // 2,
             self.window_height // 2,
             text=text,
             width=wrap_width,
             justify='center',
-            font=('Microsoft YaHei', render_size, 'bold'),
-            fill=self.settings['appearance']['text_color'])
+            font=('Microsoft YaHei', -render_px, 'bold'),
+            fill=self._text_fill())
         try:
             bbox = self.canvas.bbox(item)
             if bbox:
@@ -1421,6 +1557,7 @@ class ShortcutNotifier:
             self.current_after_id = None
         self.current_shortcut = shortcut_id
         self.current_message = message
+        self._refresh_dpi()
         if self.window:
             self.update_window_content()
             self.window_created_time = time.time()
@@ -1431,7 +1568,10 @@ class ShortcutNotifier:
                 pass
         else:
             self.create_floating_window()
-        self.reset_timer()
+        if self.live_preview_active and shortcut_id == '__preview__':
+            self._keep_preview_alive()
+        else:
+            self.reset_timer()
 
     def cancel_fade(self):
         self.is_fading = False
@@ -1445,6 +1585,7 @@ class ShortcutNotifier:
     def update_window_content(self):
         if not (self.window and self.canvas):
             return
+        self._refresh_dpi()
         if self.current_count > 1:
             display_text = f"{self.current_message} ×{self.current_count}"
         else:
@@ -1663,6 +1804,11 @@ class ShortcutNotifier:
             except Exception:
                 pass
             self.force_close_window()
+            if self.live_preview_active:
+                try:
+                    self.root.after(100, self.update_preview)
+                except Exception:
+                    pass
 
     def show_drag_hint(self):
         if self.window:
@@ -1709,6 +1855,10 @@ class ShortcutNotifier:
                 self.root.after_cancel(self.current_after_id)
             except Exception:
                 pass
+        if self.live_preview_active:
+            # 实时预览期间不自动消失
+            self.current_after_id = None
+            return
         self.current_after_id = self.root.after(
             self.display_duration, self.start_fade_out)
 
@@ -1722,6 +1872,8 @@ class ShortcutNotifier:
 
         self.settings_snapshot = copy.deepcopy(self.settings)
         self.capture_active = False
+        self.settings_dirty = False
+        self._refresh_dpi()
 
         win = ctk.CTkToplevel(self.root)
         self.settings_window = win
@@ -1746,6 +1898,12 @@ class ShortcutNotifier:
         tab_presets = tabview.add("软件预设")
         tab_appearance = tabview.add("外观")
         tab_system = tabview.add("系统")
+        self.settings_tabview = tabview
+        try:
+            tabview.configure(
+                command=lambda: self._on_tab_change(tabview.get()))
+        except Exception:
+            pass
 
         self.build_my_shortcuts_tab(tab_my)
         self.build_presets_tab(tab_presets)
@@ -1815,11 +1973,14 @@ class ShortcutNotifier:
 
         enabled_var = tk.BooleanVar(value=cfg.get('enabled', True))
         ctk.CTkCheckBox(row, text='', width=36,
-                        variable=enabled_var).grid(row=0, column=0, padx=(10, 2), pady=8)
+                        variable=enabled_var,
+                        command=self._mark_dirty).grid(
+            row=0, column=0, padx=(10, 2), pady=8)
         ctk.CTkLabel(row, text=shortcut, width=190,
                      font=ctk.CTkFont(size=13, weight='bold')).grid(
             row=0, column=1, padx=8, pady=8)
         display_var = tk.StringVar(value=cfg.get('display', shortcut.upper()))
+        display_var.trace_add('write', lambda *_: self._mark_dirty())
         ctk.CTkEntry(row, textvariable=display_var, height=30).grid(
             row=0, column=2, sticky='ew', padx=8, pady=8)
         ctk.CTkButton(
@@ -1839,6 +2000,7 @@ class ShortcutNotifier:
             self.settings['shortcuts'].pop(shortcut, None)
             self.shortcut_rows.pop(shortcut, None)
             row_frame.destroy()
+            self._mark_dirty()
             if not self.shortcut_rows:
                 self.my_empty_label = ctk.CTkLabel(
                     self.my_shortcuts_frame,
@@ -1879,6 +2041,7 @@ class ShortcutNotifier:
             self.add_my_shortcut_row(
                 self.my_shortcuts_frame, shortcut,
                 self.settings['shortcuts'][shortcut])
+        self._mark_dirty()
         messagebox.showinfo("成功", f"已添加 {display}\n点击“保存”后生效")
 
     def on_capture_canceled(self):
@@ -1946,14 +2109,8 @@ class ShortcutNotifier:
         # 自动模式为会话级设置，不写入设置文件（每次启动默认关闭）
         self.refresh_foreground_match()
         self.refresh_tray_menu()
-
-    def _on_continuous_mode_toggle(self):
-        want = bool(self.continuous_mode_var.get())
-        if want and not self._confirm_continuous_mode_enable():
-            self.continuous_mode_var.set(False)
-            return
-        self._set_continuous_mode(want)
-        self.refresh_tray_menu()
+        self._mark_dirty()
+        self.root.after(300, self.refresh_tray_menu)
 
     def tray_toggle_continuous_mode(self, icon, item):
         self.root.after(0, self._toggle_continuous_mode_from_tray)
@@ -1999,6 +2156,7 @@ class ShortcutNotifier:
         self.settings_manager.save_settings()
         self.refresh_foreground_match()
         self.refresh_tray_menu()
+        self.root.after(300, self.refresh_tray_menu)
 
     def _confirm_auto_mode_enable(self):
         """开启自动模式前的免责声明，同意返回 True"""
@@ -2010,7 +2168,7 @@ class ShortcutNotifier:
             "是否开启自动模式？",
             icon='info')
 
-    def preset_matches_query(self, preset, query):
+    def preset_matches_query(self, preset, pid, query):
         if query in preset['name'].lower() or query in preset['category'].lower():
             return True
         if query in (preset.get('description') or '').lower():
@@ -2020,17 +2178,30 @@ class ShortcutNotifier:
                 return True
             if query in (cfg.get('display') or '').lower():
                 return True
+        # 用户修改过的快捷键与提示文本也参与搜索
+        overrides = self.settings.get('preset_states', {}).get(
+            pid, {}).get('shortcuts', {})
+        for ov in overrides.values():
+            if query in (ov.get('key') or '').lower():
+                return True
+            if query in (ov.get('display') or '').lower():
+                return True
         return False
 
     def rebuild_presets_list(self):
         if not self.presets_frame:
             return
-        for w in self.presets_frame.winfo_children():
-            w.destroy()
+        try:
+            for w in self.presets_frame.winfo_children():
+                w.destroy()
+        except Exception:
+            self.presets_frame = None
+            return
         self.preset_cards = {}
         self.preset_count_labels = {}
         self.preset_row_vars = {}
         self.preset_display_vars = {}
+        self.preset_key_labels = {}
         self.preset_bodies = {}
         self.preset_expand_buttons = {}
         query = ''
@@ -2041,7 +2212,7 @@ class ShortcutNotifier:
             preset = PRESET_LIBRARY.get(pid)
             if not preset:
                 continue
-            if query and not self.preset_matches_query(preset, query):
+            if query and not self.preset_matches_query(preset, pid, query):
                 continue
             self.add_preset_card(self.presets_frame, pid)
             shown += 1
@@ -2155,6 +2326,7 @@ class ShortcutNotifier:
         var = self.preset_switch_vars.get(pid)
         if var is not None:
             state['enabled'] = bool(var.get())
+        self._mark_dirty()
 
     def add_preset_shortcut_row(self, parent, pid, sc, cfg):
         state = self.settings['preset_states'].setdefault(
@@ -2162,16 +2334,18 @@ class ShortcutNotifier:
         overrides = state.setdefault('shortcuts', {})
         ov = overrides.get(sc, {})
 
-        # 设置界面里手写的 tk 控件不自动缩放，需按 DPI 系数放大字号
-        row_font = max(9, int(12 * self.font_scale))
+        # 设置界面里手写的 tk 控件不自动缩放，按显示器 DPI 换算为像素字号
+        # （负号 = 像素，不受 Tk 缩放异常影响，保证任何分辨率下 12 磅视觉一致）
+        row_font = max(9, round(12 * self.font_scale * 4 / 3))
 
         row = tk.Frame(parent, bg='#1E1E28')
         row.pack(fill='x', pady=2)
-        row.grid_columnconfigure(2, weight=1)
+        row.grid_columnconfigure(3, weight=1)
 
         enabled = ov.get('enabled', True) is not False
         enabled_var = tk.BooleanVar(value=enabled)
         self.preset_row_vars[(pid, sc)] = enabled_var
+        effective_key = ov.get('key') or sc
 
         def on_enable_change(p=pid, s=sc, var=enabled_var):
             overrides = self.settings['preset_states'].setdefault(
@@ -2181,18 +2355,38 @@ class ShortcutNotifier:
             else:
                 overrides.setdefault(s, {})['enabled'] = False
             self._update_preset_count(p)
+            self._mark_dirty()
 
         tk.Checkbutton(
             row, variable=enabled_var, command=on_enable_change,
             bg='#1E1E28', fg='#E1E1E1', activebackground='#1E1E28',
             activeforeground='#E1E1E1', selectcolor='#2D2B3E',
             highlightthickness=0, bd=0,
-            font=('Microsoft YaHei', row_font)).grid(
+            font=('Microsoft YaHei', -row_font)).grid(
             row=0, column=0, padx=(8, 2), pady=5)
-        tk.Label(
-            row, text=sc, width=24, anchor='w', bg='#1E1E28', fg='#E1E1E1',
-            font=('Microsoft YaHei', row_font, 'bold')).grid(
-            row=0, column=1, padx=6, pady=5)
+        key_label = tk.Label(
+            row, text=effective_key, width=22, anchor='w',
+            bg='#1E1E28', fg='#E1E1E1',
+            font=('Microsoft YaHei', -row_font, 'bold'))
+        key_label.grid(row=0, column=1, padx=6, pady=5)
+        self.preset_key_labels[(pid, sc)] = key_label
+
+        def on_remap(p=pid, s=sc):
+            self.capture_active = True
+            self.update_suspend()
+            self.capture_dialog = KeyCaptureDialog(
+                self.settings_window,
+                on_capture=lambda combo: self.on_preset_shortcut_remapped(
+                    p, s, combo),
+                on_cancel=self.on_capture_canceled)
+            self.capture_dialog.show()
+
+        tk.Button(
+            row, text="改", width=3, bg='#2B3A55', fg='#E1E1E1',
+            activebackground='#3A4A6A', activeforeground='#E1E1E1',
+            relief='flat', bd=0, command=on_remap,
+            font=('Microsoft YaHei', -row_font)).grid(
+            row=0, column=2, padx=(6, 2), pady=5)
 
         display_var = tk.StringVar(value=ov.get('display') or cfg.get('display') or sc)
 
@@ -2200,6 +2394,7 @@ class ShortcutNotifier:
             overrides = self.settings['preset_states'].setdefault(
                 p, {'enabled': False, 'shortcuts': {}})['shortcuts']
             overrides.setdefault(s, {})['display'] = var.get()
+            self._mark_dirty()
 
         display_var.trace_add('write', lambda *_: on_display_change())
         tk.Entry(
@@ -2207,8 +2402,8 @@ class ShortcutNotifier:
             insertbackground='#E1E1E1', relief='flat',
             highlightthickness=1, highlightbackground='#3A3A4C',
             highlightcolor='#4A6A9A',
-            font=('Microsoft YaHei', row_font)).grid(
-            row=0, column=2, sticky='ew', padx=6, pady=5)
+            font=('Microsoft YaHei', -row_font)).grid(
+            row=0, column=3, sticky='ew', padx=6, pady=5)
         self.preset_display_vars[(pid, sc)] = display_var
 
         def on_reset(p=pid, s=sc):
@@ -2222,14 +2417,41 @@ class ShortcutNotifier:
             if dvar:
                 dvar.set(PRESET_LIBRARY[p]['shortcuts'][s].get(
                     'display') or s)
+            key_lbl = self.preset_key_labels.get((p, s))
+            if key_lbl:
+                key_lbl.configure(text=s)
             self._update_preset_count(p)
+            self._mark_dirty()
 
         tk.Button(
             row, text="↺", width=4, bg='#3A3A3C', fg='#E1E1E1',
             activebackground='#4A4A4C', activeforeground='#E1E1E1',
             relief='flat', bd=0, command=on_reset,
-            font=('Microsoft YaHei', row_font)).grid(
-            row=0, column=3, padx=(6, 8), pady=5)
+            font=('Microsoft YaHei', -row_font)).grid(
+            row=0, column=4, padx=(6, 8), pady=5)
+
+    def on_preset_shortcut_remapped(self, pid, sc, new_combo):
+        """用户把预设中的某个快捷键改为自己录制的新组合"""
+        self.capture_dialog = None
+        self.capture_active = False
+        self.update_suspend()
+        try:
+            keyboard.parse_hotkey(new_combo)
+        except Exception as e:
+            messagebox.showerror(
+                "无法识别", f"无法识别按键组合 {new_combo}\n请重新录制。\n({e})")
+            return
+        overrides = self.settings['preset_states'].setdefault(
+            pid, {'enabled': False, 'shortcuts': {}})['shortcuts']
+        overrides.setdefault(sc, {})['key'] = new_combo
+        key_label = self.preset_key_labels.get((pid, sc))
+        if key_label:
+            key_label.configure(text=new_combo)
+        self._mark_dirty()
+        messagebox.showinfo(
+            "已修改",
+            f"预设快捷键已改为 {self.format_display_name(new_combo)}\n"
+            "点击“保存”后生效")
 
     def preset_bulk_enable(self, pid):
         overrides = self.settings['preset_states'].setdefault(
@@ -2244,6 +2466,7 @@ class ShortcutNotifier:
             if var:
                 var.set(True)
         self._update_preset_count(pid)
+        self._mark_dirty()
 
     def preset_bulk_disable(self, pid):
         overrides = self.settings['preset_states'].setdefault(
@@ -2254,6 +2477,7 @@ class ShortcutNotifier:
             if var:
                 var.set(False)
         self._update_preset_count(pid)
+        self._mark_dirty()
 
     def preset_reset(self, pid):
         state = self.settings['preset_states'].setdefault(
@@ -2267,7 +2491,11 @@ class ShortcutNotifier:
             if dvar:
                 dvar.set(PRESET_LIBRARY[pid]['shortcuts'][sc].get(
                     'display') or sc)
+            key_lbl = self.preset_key_labels.get((pid, sc))
+            if key_lbl:
+                key_lbl.configure(text=sc)
         self._update_preset_count(pid)
+        self._mark_dirty()
 
     def _update_preset_count(self, pid):
         """局部更新某张卡片的已启用数量（不重建界面）"""
@@ -2295,12 +2523,12 @@ class ShortcutNotifier:
         preview_box = ctk.CTkFrame(frame, corner_radius=10)
         preview_box.grid(row=0, column=0, columnspan=3,
                          padx=6, pady=(0, 12), sticky='ew')
-        self.preview_canvas = tk.Canvas(
-            preview_box, width=430, height=86,
-            highlightthickness=0, bg='#14141C')
-        self.preview_canvas.pack(padx=10, pady=10, fill='x')
-        self.preview_label = ctk.CTkLabel(frame, text="实时预览")
-        self.preview_label.grid(row=0, column=3, padx=12, sticky='w')
+        self.preview_label = ctk.CTkLabel(
+            preview_box,
+            text="提示框预览：进入本页后会在屏幕上显示真实的提示框，"
+                 "修改外观会实时更新；可直接拖动提示框调整位置。",
+            text_color='gray', justify='left', anchor='w', wraplength=540)
+        self.preview_label.pack(fill='x', padx=14, pady=12)
 
         row = 1
         ctk.CTkLabel(frame, text="窗口透明度").grid(
@@ -2308,10 +2536,24 @@ class ShortcutNotifier:
         self.opacity_var = tk.DoubleVar(value=ap['window_opacity'])
         self.opacity_slider = ctk.CTkSlider(
             frame, from_=0.3, to=1.0, number_of_steps=14,
-            variable=self.opacity_var, command=lambda v: self.update_preview())
+            variable=self.opacity_var, command=self._on_appearance_changed)
         self.opacity_slider.grid(row=row, column=1, sticky='ew', padx=6, pady=7)
         self.opacity_pct_label = ctk.CTkLabel(frame, text="")
         self.opacity_pct_label.grid(row=row, column=2, padx=6)
+
+        row += 1
+        ctk.CTkLabel(frame, text="文字透明度").grid(
+            row=row, column=0, sticky='w', padx=6, pady=7)
+        self.text_opacity_var = tk.DoubleVar(
+            value=float(ap.get('text_opacity') or 1.0))
+        self.text_opacity_slider = ctk.CTkSlider(
+            frame, from_=0.1, to=1.0, number_of_steps=18,
+            variable=self.text_opacity_var,
+            command=self._on_appearance_changed)
+        self.text_opacity_slider.grid(
+            row=row, column=1, sticky='ew', padx=6, pady=7)
+        self.text_opacity_pct_label = ctk.CTkLabel(frame, text="")
+        self.text_opacity_pct_label.grid(row=row, column=2, padx=6)
 
         row += 1
         ctk.CTkLabel(frame, text="显示时长(秒)").grid(
@@ -2336,7 +2578,7 @@ class ShortcutNotifier:
         ctk.CTkOptionMenu(
             pos_frame, values=POSITIONS, width=170,
             variable=self.position_var,
-            command=lambda v: self.update_preview()).pack(side='left')
+            command=self._on_appearance_changed).pack(side='left')
         ctk.CTkButton(
             pos_frame, text="拖动定位", width=90, height=30,
             command=self.show_drag_hint).pack(side='left', padx=8)
@@ -2408,8 +2650,9 @@ class ShortcutNotifier:
         for var in [self.duration_var, self.fade_duration_var,
                     self.bg_color_var, self.text_color_var,
                     self.border_color_var, self.font_size_var,
+                    self.opacity_var, self.text_opacity_var,
                     self.width_override_var, self.height_override_var]:
-            var.trace_add('write', lambda *_: self.update_preview())
+            var.trace_add('write', self._on_appearance_changed)
         self.update_preview()
 
     def choose_color(self, color_var):
@@ -2418,30 +2661,36 @@ class ShortcutNotifier:
             color_var.set(color[1])
 
     def update_preview(self):
-        try:
-            if not self.preview_canvas or not self.preview_canvas.winfo_exists():
-                return
-            self.preview_canvas.delete('all')
-            bg = self.bg_color_var.get().strip()
-            text = self.text_color_var.get().strip()
-            border = self.border_color_var.get().strip()
+        """把当前外观设置实时应用到屏幕上的真实提示框"""
+        if not hasattr(self, 'opacity_var') or not hasattr(
+                self, 'text_opacity_var'):
+            return
+        if self.live_preview_after:
             try:
-                size = int(self.font_size_var.get())
+                self.root.after_cancel(self.live_preview_after)
             except Exception:
-                size = 12
+                pass
+            self.live_preview_after = None
+        try:
             try:
                 opacity = float(self.opacity_var.get())
             except Exception:
                 opacity = 0.75
             try:
-                width_ov = int(self.width_override_var.get())
+                text_opacity = float(self.text_opacity_var.get())
+            except Exception:
+                text_opacity = 1.0
+            try:
+                width_ov = int(self.width_override_var.get().strip() or '0')
             except Exception:
                 width_ov = 0
             try:
-                height_ov = int(self.height_override_var.get())
+                height_ov = int(self.height_override_var.get().strip() or '0')
             except Exception:
                 height_ov = 0
-            self.opacity_pct_label.config(text=f"{int(opacity * 100)}%")
+            self.opacity_pct_label.configure(text=f"{int(opacity * 100)}%")
+            self.text_opacity_pct_label.configure(
+                text=f"{int(text_opacity * 100)}%")
             if width_ov > 0 and height_ov > 0:
                 size_hint = f"固定 {width_ov}×{height_ov}"
             elif width_ov > 0:
@@ -2450,29 +2699,117 @@ class ShortcutNotifier:
                 size_hint = f"固定高度 {height_ov}px"
             else:
                 size_hint = "自动尺寸"
-            self.preview_label.config(text=f"实时预览 · {size_hint}")
+            self.preview_label.configure(
+                text=f"提示框预览（{size_hint}）：修改外观会实时更新到屏幕上的提示框；"
+                     "可直接拖动提示框调整位置。")
 
-            if not (is_valid_color(bg) and is_valid_color(text)
-                    and is_valid_color(border)):
-                self.preview_canvas.create_text(
-                    215, 45, text="颜色需为 #RRGGBB 格式",
-                    fill='#888888', font=('Microsoft YaHei', 10))
+            # 预览阶段写入 settings（保存时才落盘），并同步真实提示框
+            ap = self.settings['appearance']
+            ap['window_opacity'] = min(1.0, max(0.3, opacity))
+            ap['text_opacity'] = min(1.0, max(0.1, text_opacity))
+            position = self.position_var.get().strip()
+            if position in POSITIONS:
+                ap['position'] = position
+            bg = self.bg_color_var.get().strip()
+            text = self.text_color_var.get().strip()
+            border = self.border_color_var.get().strip()
+            if is_valid_color(bg):
+                ap['bg_color'] = bg.upper()
+            if is_valid_color(text):
+                ap['text_color'] = text.upper()
+            if is_valid_color(border):
+                ap['border_color'] = border.upper()
+            try:
+                ap['font_size'] = min(32, max(8, int(self.font_size_var.get())))
+            except Exception:
+                pass
+            try:
+                ap['width_override'] = max(
+                    0, min(2000, int(self.width_override_var.get().strip() or '0')))
+            except Exception:
+                pass
+            try:
+                ap['height_override'] = max(
+                    0, min(600, int(self.height_override_var.get().strip() or '0')))
+            except Exception:
+                pass
+            self.fade_alpha = ap['window_opacity']
+            if not self.live_preview_active:
                 return
-
-            w, h, x, y = 410, 62, 10, 12
-            self.preview_canvas.create_polygon(
-                offset_points(rounded_rect_points(w, h, 8, 1), x, y),
-                smooth=True, fill=border)
-            self.preview_canvas.create_polygon(
-                offset_points(rounded_rect_points(w, h, 8, 0), x, y),
-                smooth=True, fill=bg)
-            self.preview_canvas.create_text(
-                x + w // 2, y + h // 2,
-                text=f"预览 {size}pt",
-                font=('Microsoft YaHei', size, 'bold'),
-                fill=text)
+            if self.window and self.window.winfo_exists():
+                if self.current_message != PREVIEW_TEXT:
+                    self.current_message = PREVIEW_TEXT
+                    self.current_shortcut = '__preview__'
+                    self.current_count = 1
+                self.update_window_content()
+                try:
+                    self.window.attributes('-alpha', self.fade_alpha)
+                except Exception:
+                    pass
+            else:
+                self._show_message(PREVIEW_TEXT, '__preview__')
+                self._keep_preview_alive()
         except Exception as e:
             safe_log(f"预览更新失败: {e}")
+
+    def _on_appearance_changed(self, *_):
+        """外观任意修改：标记未保存 + 防抖刷新真实提示框"""
+        self._mark_dirty()
+        if self.live_preview_after:
+            try:
+                self.root.after_cancel(self.live_preview_after)
+            except Exception:
+                pass
+        self.live_preview_after = self.root.after(60, self.update_preview)
+
+    def _start_live_preview(self):
+        if self.live_preview_active:
+            return
+        self.live_preview_active = True
+        try:
+            self._show_message(PREVIEW_TEXT, '__preview__')
+            self._keep_preview_alive()
+        except Exception as e:
+            safe_log(f"启动实时预览失败: {e}")
+
+    def _keep_preview_alive(self):
+        """实时预览期间：取消自动消失，并保持看门狗运行"""
+        if self._drag_hint:
+            # 拖动定位提示使用自己的 20 秒计时，不在此处取消
+            return
+        if self.current_after_id:
+            try:
+                self.root.after_cancel(self.current_after_id)
+            except Exception:
+                pass
+            self.current_after_id = None
+        self.cancel_fade()
+        if not self.watchdog_active:
+            self.watchdog_active = True
+            self.window_created_time = time.time()
+            self.watchdog_check()
+
+    def _stop_live_preview(self):
+        self.live_preview_active = False
+        if self.live_preview_after:
+            try:
+                self.root.after_cancel(self.live_preview_after)
+            except Exception:
+                pass
+            self.live_preview_after = None
+        if self.window and self.window.winfo_exists():
+            self.force_close_window()
+
+    def _on_tab_change(self, tab_name):
+        """切换到外观页时显示真实提示框预览，离开时隐藏"""
+        if self.live_preview_active:
+            if tab_name != '外观':
+                self._stop_live_preview()
+        elif tab_name == '外观':
+            self._start_live_preview()
+
+    def _mark_dirty(self):
+        self.settings_dirty = True
 
     # ---------- 系统页 ----------
 
@@ -2487,7 +2824,7 @@ class ShortcutNotifier:
             card, text="开机自启", font=ctk.CTkFont(size=15, weight='bold'),
             anchor='w').pack(fill='x', padx=16, pady=(14, 0))
         ctk.CTkLabel(
-            card, text="登录 Windows 后自动运行本程序（注册表 + 启动文件夹双保险）",
+            card, text="登录 Windows 后自动运行本程序",
             text_color='gray', anchor='w', justify='left').pack(
             fill='x', padx=16, pady=(4, 12))
         self.autostart_var = tk.BooleanVar(
@@ -2495,7 +2832,7 @@ class ShortcutNotifier:
             or self.check_autostart())
         ctk.CTkSwitch(
             card, text="开机自动启动", variable=self.autostart_var,
-            command=lambda: self._set_autostart(self.autostart_var.get())
+            command=self._on_autostart_toggle
         ).pack(anchor='w', padx=16, pady=(0, 14))
 
         card2 = ctk.CTkFrame(frame, corner_radius=10)
@@ -2508,12 +2845,23 @@ class ShortcutNotifier:
                         "自动启用对应软件的快捷键预设；切换到没有预设的软件时自动回到已手动启用的预设。",
             text_color='gray', anchor='w', justify='left').pack(
             fill='x', padx=16, pady=(4, 14))
+
+        card_warn = ctk.CTkFrame(
+            frame, corner_radius=10, border_width=1,
+            border_color='#7A5A2B', fg_color='#2B2418')
+        card_warn.pack(fill='x', pady=6)
         ctk.CTkLabel(
-            card2, text="注意：调出任务管理器（尤其是以管理员权限运行时）可能导致按键提示暂时失效"
-                        "或显示异常；关闭任务管理器后会自动恢复，如仍异常可重启程序。",
+            card_warn, text="任务管理器提示",
+            font=ctk.CTkFont(size=15, weight='bold'),
+            text_color='#E0A94F', anchor='w').pack(
+            fill='x', padx=16, pady=(14, 0))
+        ctk.CTkLabel(
+            card_warn, text="注意：调出任务管理器（尤其是以管理员权限运行时）"
+                            "可能导致按键提示暂时失效或显示异常；"
+                            "关闭任务管理器后会自动恢复，如仍异常可重启程序。",
             text_color='#C9A86A', anchor='w', justify='left',
             font=ctk.CTkFont(size=13)).pack(
-            fill='x', padx=16, pady=(0, 14))
+            fill='x', padx=16, pady=(4, 14))
 
         card_cont = ctk.CTkFrame(frame, corner_radius=10)
         card_cont.pack(fill='x', pady=6)
@@ -2530,7 +2878,7 @@ class ShortcutNotifier:
         ctk.CTkSwitch(
             card_cont, text="开启持续输出模式",
             variable=self.continuous_mode_var,
-            command=self._on_continuous_mode_toggle
+            command=self._on_settings_continuous_toggle
         ).pack(anchor='w', padx=16, pady=(0, 14))
 
         card3 = ctk.CTkFrame(frame, corner_radius=10)
@@ -2538,10 +2886,46 @@ class ShortcutNotifier:
         ctk.CTkLabel(
             card3, text="其他", font=ctk.CTkFont(size=15, weight='bold'),
             anchor='w').pack(fill='x', padx=16, pady=(14, 0))
-        ctk.CTkLabel(
-            card3, text=f"设置文件：{self.settings_manager.settings_file}",
-            text_color='gray', anchor='w', justify='left').pack(
-            fill='x', padx=16, pady=(4, 4))
+        path_frame = ctk.CTkFrame(card3, fg_color='transparent')
+        path_frame.pack(fill='x', padx=16, pady=(4, 4))
+        self.settings_path_entry = ctk.CTkEntry(
+            path_frame, width=560, height=32)
+        self.settings_path_entry.insert(
+            0, self.settings_manager.settings_file)
+        self.settings_path_entry.configure(state='readonly')
+        self.settings_path_entry.pack(side='left', fill='x', expand=True)
+
+        def copy_settings_path():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(
+                    self.settings_manager.settings_file)
+                messagebox.showinfo(
+                    "已复制", "设置文件路径已复制到剪贴板")
+            except Exception as e:
+                safe_log(f"复制设置路径失败: {e}")
+
+        def open_settings_folder():
+            try:
+                path = self.settings_manager.settings_file
+                if os.path.exists(path):
+                    subprocess.Popen(
+                        ['explorer', '/select,', path], shell=False)
+                else:
+                    subprocess.Popen(
+                        ['explorer',
+                         os.path.dirname(path) or os.environ.get('APPDATA', '.')],
+                        shell=False)
+            except Exception as e:
+                safe_log(f"打开设置目录失败: {e}")
+
+        ctk.CTkButton(
+            path_frame, text="复制路径", width=88, height=30,
+            command=copy_settings_path).pack(side='left', padx=6)
+        ctk.CTkButton(
+            path_frame, text="打开所在文件夹", width=120, height=30,
+            fg_color='#3A3A3C', hover_color='#4A4A4C',
+            command=open_settings_folder).pack(side='left')
         ctk.CTkLabel(
             card3, text="如需彻底重置，可删除上方设置文件后重启程序。",
             text_color='gray', anchor='w', justify='left').pack(
@@ -2555,8 +2939,9 @@ class ShortcutNotifier:
         about_rows = [
             ("软件名", f"{APP_NAME_CN}"),
             ("开发者", "Michael2070"),
-            ("开发环境", "Windows / Python 3.13 + Tkinter（CustomTkinter）"),
-            ("AI 模型", "GPT-5（Codex）"),
+            ("开发环境", "Windows / Python + Tkinter（CustomTkinter）"),
+            ("AI 模型", "deepseek-v4-flash (Codex)"),
+            ("平台", "GitHub · B站 · 抖音"),
         ]
         about_frame = ctk.CTkFrame(card4, fg_color='transparent')
         about_frame.pack(fill='x', padx=16, pady=(4, 14))
@@ -2572,6 +2957,7 @@ class ShortcutNotifier:
     def apply_settings(self):
         try:
             opacity = float(self.opacity_var.get())
+            text_opacity = float(self.text_opacity_var.get())
             duration = float(self.duration_var.get())
             fade = float(self.fade_duration_var.get())
             position = self.position_var.get().strip()
@@ -2588,6 +2974,8 @@ class ShortcutNotifier:
         errors = []
         if not 0.3 <= opacity <= 1.0:
             errors.append("透明度应在 0.3 ~ 1.0 之间")
+        if not 0.1 <= text_opacity <= 1.0:
+            errors.append("文字透明度应在 0.1 ~ 1.0 之间")
         if not 0.5 <= duration <= 10:
             errors.append("显示时长应在 0.5 ~ 10 秒之间")
         if not 0.1 <= fade <= 3:
@@ -2621,6 +3009,7 @@ class ShortcutNotifier:
 
         ap = self.settings['appearance']
         ap['window_opacity'] = round(opacity, 2)
+        ap['text_opacity'] = round(text_opacity, 2)
         ap['display_duration'] = int(duration * 1000)
         ap['fade_duration'] = int(fade * 1000)
         ap['position'] = position
@@ -2630,6 +3019,32 @@ class ShortcutNotifier:
         ap['font_size'] = font_size
         ap['width_override'] = width_override
         ap['height_override'] = height_override
+
+        # 开机自启：设置页开关仅在保存时真正写入注册表/启动项
+        try:
+            want_autostart = bool(self.autostart_var.get())
+            snapshot_autostart = bool(
+                (self.settings_snapshot or {}).get('autostart', False)
+                or self.check_autostart())
+            if want_autostart != snapshot_autostart:
+                if want_autostart:
+                    ok, err = self.add_autostart()
+                    if not ok:
+                        messagebox.showerror("开机自启", f"开启失败：{err}")
+                        self.autostart_var.set(
+                            self.check_autostart())
+                        return
+                else:
+                    self.remove_autostart()
+                self.settings['autostart'] = want_autostart
+        except Exception as e:
+            safe_log(f"保存开机自启设置失败: {e}")
+
+        # 持续输出模式：设置页开关在保存时应用（开启会停用自动模式）
+        want_continuous = bool(self.continuous_mode_var.get())
+        if want_continuous:
+            self.settings['auto_mode'] = False
+        self._set_continuous_mode(want_continuous)
 
         if not self.settings_manager.save_settings():
             messagebox.showerror("错误", "保存设置失败，请检查文件写入权限")
@@ -2643,10 +3058,21 @@ class ShortcutNotifier:
 
         self.refresh_foreground_match()
         self.sync_hotkeys()
+        self.settings_dirty = False
         self.close_settings_window()
         messagebox.showinfo("成功", "设置已保存并生效")
 
     def cancel_settings(self):
+        if self.settings_dirty:
+            choice = self._confirm_unsaved()
+            if choice == 'save':
+                self.apply_settings()
+                return
+            if choice == 'stay':
+                return
+        self._discard_settings_changes()
+
+    def _discard_settings_changes(self):
         if self.capture_dialog:
             try:
                 self.capture_dialog.cancel()
@@ -2654,9 +3080,87 @@ class ShortcutNotifier:
                 pass
         self.settings = copy.deepcopy(self.settings_snapshot)
         self.settings_manager.settings = self.settings
+        # 恢复会话级状态（自动模式/持续输出模式不会写文件，需手动同步）
+        self.continuous_mode = bool(self.settings.get('continuous_mode', False))
+        self.matched_preset_ids = set()
+        self.refresh_foreground_match()
+        self.sync_hotkeys()
+        self.refresh_tray_menu()
         self.close_settings_window()
 
+    def _confirm_unsaved(self):
+        """未保存修改确认框：保存并退出 / 退出 / 取消"""
+        result = {'value': None}
+        try:
+            dlg = ctk.CTkToplevel(self.settings_window)
+        except Exception:
+            # 极端情况下回退到默认行为：直接退出
+            return 'discard'
+        dlg.title("未保存的修改")
+        dlg.geometry("440x230")
+        dlg.resizable(False, False)
+        dlg.transient(self.settings_window)
+        dlg.attributes('-topmost', True)
+        ctk.CTkLabel(
+            dlg, text="设置已修改但尚未保存",
+            font=ctk.CTkFont(size=15, weight='bold')).pack(
+            pady=(26, 6))
+        ctk.CTkLabel(
+            dlg, text="是否保存修改后再退出？",
+            text_color='gray').pack(pady=(0, 18))
+        btn_frame = ctk.CTkFrame(dlg, fg_color='transparent')
+        btn_frame.pack(pady=(0, 20))
+
+        def choose(value):
+            result['value'] = value
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        ctk.CTkButton(
+            btn_frame, text="保存并退出", width=130,
+            command=lambda: choose('save')).pack(side='left', padx=6)
+        ctk.CTkButton(
+            btn_frame, text="退出", width=100,
+            fg_color='#3A3A3C', hover_color='#4A4A4C',
+            command=lambda: choose('discard')).pack(side='left', padx=6)
+        ctk.CTkButton(
+            btn_frame, text="取消", width=100,
+            fg_color='#3A3A3C', hover_color='#4A4A4C',
+            command=lambda: choose('stay')).pack(side='left', padx=6)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose('stay'))
+        dlg.grab_set()
+        try:
+            dlg.wait_window()
+        except Exception:
+            pass
+        return result['value'] or 'stay'
+
+    def _on_autostart_toggle(self):
+        """设置页的开机自启开关：只改状态并标记未保存，保存时才写入系统"""
+        want = bool(self.autostart_var.get())
+        self.settings['autostart'] = want
+        self._mark_dirty()
+
+    def _on_settings_continuous_toggle(self):
+        """设置页的持续输出开关：只改状态并标记未保存，保存时才生效"""
+        want = bool(self.continuous_mode_var.get())
+        self.settings['continuous_mode'] = want
+        if want:
+            self.settings['auto_mode'] = False
+            if hasattr(self, 'auto_mode_var'):
+                try:
+                    self.auto_mode_var.set(False)
+                except Exception:
+                    pass
+        self._mark_dirty()
+
     def close_settings_window(self):
+        self._stop_live_preview()
+        self.settings_tabview = None
+        self.settings_dirty = False
+        self.presets_frame = None
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.destroy()
         self.settings_window = None
@@ -2927,6 +3431,7 @@ class ShortcutNotifier:
         else:
             messagebox.showinfo("自动模式", "已关闭自动模式")
         self.refresh_tray_menu()
+        self.root.after(300, self.refresh_tray_menu)
 
     def show_startup_notice(self):
         try:
@@ -2956,10 +3461,21 @@ class ShortcutNotifier:
             safe_log(f"提示任务管理器说明失败: {e}")
 
     def quit_app(self):
+        self._schedule_exit(delay_ms=150, force_after_ms=5000)
+
+    def _schedule_exit(self, delay_ms=600, force_after_ms=8000):
+        """优雅退出：先清理监听/托盘/互斥，再让主循环正常结束。
+        正常退出可让 PyInstaller 引导程序完成临时目录清理，避免下次启动
+        报“Failed to remove temporary directory / Failed to start
+        embedded python interpreter”。若某线程卡住则用守护线程兜底强退。"""
+        if self._exiting:
+            return
+        self._exiting = True
         self.running = False
         self.listener_stop.set()
         self.listener_reload.set()
         self.clear_all_timers()
+        self._stop_live_preview()
         try:
             keyboard.unhook_all()
         except Exception:
@@ -2969,40 +3485,69 @@ class ShortcutNotifier:
                 self.tray_icon.stop()
             except Exception:
                 pass
+        release_single_instance_mutex()
+
+        def _force_exit():
+            time.sleep(max(force_after_ms, 3000) / 1000.0)
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_force_exit, daemon=True).start()
+        try:
+            self.root.after(delay_ms, self._finish_exit)
+        except Exception:
+            os._exit(0)
+
+    def _finish_exit(self):
         try:
             self.root.quit()
         except Exception:
-            pass
-        os._exit(0)
+            os._exit(0)
 
     def restart_program(self):
-        """重启程序：先启动新进程再退出当前进程"""
+        """重启程序：先启动新进程（独立工作目录），再优雅退出当前进程。
+
+        关键：新进程必须以稳定的目录作为工作目录，绝不能继承当前
+        PyInstaller onefile 的 _MEI 临时目录，否则父进程退出清理临时目录
+        时会失败，新进程也会因工作目录异常而启动报错。"""
+        if self._restarting:
+            return
+        self._restarting = True
         try:
-            self.clear_all_timers()
-            self.listener_stop.set()
-            self.listener_reload.set()
-            try:
-                keyboard.unhook_all()
-            except Exception:
-                pass
-            if self.tray_icon:
-                try:
-                    self.tray_icon.stop()
-                except Exception:
-                    pass
-            # 先释放单实例互斥，否则新进程会误判为“程序已在运行”
-            release_single_instance_mutex()
             if getattr(sys, 'frozen', False):
-                subprocess.Popen([sys.executable], shell=False)
+                exe = sys.executable
+                args = [exe]
+                cwd = os.path.dirname(os.path.abspath(exe))
             else:
                 pythonw = os.path.join(
                     os.path.dirname(sys.executable), 'pythonw.exe')
                 exe = pythonw if os.path.exists(pythonw) else sys.executable
+                args = [exe, os.path.abspath(sys.argv[0])]
+                cwd = os.path.dirname(os.path.abspath(sys.argv[0]))
+            creationflags = 0
+            if os.name == 'nt':
+                # DETACHED_PROCESS：脱离父进程控制台，避免引导程序互相干扰
+                creationflags = 0x00000008
+            try:
                 subprocess.Popen(
-                    [exe, os.path.abspath(sys.argv[0])], shell=False)
-            self.root.after(200, lambda: os._exit(0))
+                    args, shell=False, cwd=cwd,
+                    creationflags=creationflags, close_fds=True)
+            except Exception as e:
+                safe_log(f"重启：新进程启动失败: {e}")
+                self._restarting = False
+                try:
+                    messagebox.showerror(
+                        "错误", f"重启失败，无法启动新进程：\n{e}")
+                except Exception:
+                    pass
+                return
+            # 给新进程一点启动时间再退出，避免临时目录清理竞争
+            self._schedule_exit(delay_ms=800, force_after_ms=10000)
         except Exception as e:
             safe_log(f"重启失败: {e}")
+            self._restarting = False
             try:
                 messagebox.showerror("错误", f"重启失败: {e}")
             except Exception:
